@@ -77,10 +77,160 @@ if [ -d "$REPO_ROOT/skills" ]; then
 	done
 fi
 
-# Fetch all plugin-* repos from the stavrobot GitHub org and write a bot-consumable
-# index at static/plugins/index.md. Zola copies static/ into public/ during build,
-# so the file ends up at public/plugins/index.md without being wiped by zola build.
+# Fetch plugin repos from the stavrobot GitHub org plus a hardcoded external
+# allowlist, then write a bot-consumable index at static/plugins/index.md.
+# Zola copies static/ into public/ during build, so the file ends up at
+# public/plugins/index.md without being wiped by zola build.
 mkdir -p "$REPO_ROOT/static/plugins"
+
+# Use a GitHub token if available to avoid API rate limits on shared CI IPs.
+gh_auth=()
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+	gh_auth=(-H "Authorization: token $GITHUB_TOKEN")
+fi
+
+append_discovered_repo() {
+	local repo_owner="$1"
+	local repo_name="$2"
+	local repo_url="$3"
+	local repo_description="$4"
+	local repo_branch="$5"
+	local repo_slug="$6"
+
+	discovered_repo_owners+=("$repo_owner")
+	discovered_repo_names+=("$repo_name")
+	discovered_repo_urls+=("$repo_url")
+	discovered_repo_descriptions+=("$repo_description")
+	discovered_repo_branches+=("$repo_branch")
+	discovered_repo_slugs+=("$repo_slug")
+}
+
+derive_plugin_slug() {
+	local repo_name="$1"
+	local repo_slug
+
+	if [[ "$repo_name" == plugin-* ]]; then
+		repo_slug="${repo_name#plugin-}"
+	else
+		repo_slug="${repo_name#stavrobot-}"
+		repo_slug="${repo_slug%-plugin}"
+	fi
+
+	printf '%s\n' "$repo_slug"
+}
+
+# Declared unconditionally so the shared details loop below is safe under set -u
+# even when discovery calls fail.
+discovered_repo_owners=()
+discovered_repo_names=()
+discovered_repo_urls=()
+discovered_repo_descriptions=()
+discovered_repo_branches=()
+discovered_repo_slugs=()
+plugin_names=()
+plugin_descriptions=()
+plugin_urls=()
+plugin_slugs=()
+plugin_readmes=()
+
+# Existing stavrobot org API discovery stays separate and recognizable.
+repos_json="$(curl -sf "${gh_auth[@]}" "https://api.github.com/orgs/stavrobot/repos?per_page=100")" || true
+if [ -n "$repos_json" ]; then
+	# Output one line per repo:
+	# owner\trepo_name\tdescription\thtml_url\tdefault_branch
+	mapfile -t plugin_repos < <(
+		python3 -c '
+import sys, json
+repos = json.load(sys.stdin)
+for repo in repos:
+    if repo["name"].startswith("plugin-"):
+        owner = repo["owner"]["login"]
+        name = repo["name"]
+        description = repo.get("description") or ""
+        html_url = repo["html_url"]
+        default_branch = repo.get("default_branch") or "HEAD"
+        print(f"{owner}\t{name}\t{description}\t{html_url}\t{default_branch}")
+' <<<"$repos_json" | sort
+	)
+
+	for repo_line in "${plugin_repos[@]}"; do
+		repo_owner="$(cut -f1 <<<"$repo_line")"
+		repo_name="$(cut -f2 <<<"$repo_line")"
+		repo_description="$(cut -f3 <<<"$repo_line")"
+		repo_url="$(cut -f4 <<<"$repo_line")"
+		repo_branch="$(cut -f5 <<<"$repo_line")"
+		repo_slug="$(derive_plugin_slug "$repo_name")"
+
+		append_discovered_repo "$repo_owner" "$repo_name" "$repo_url" "$repo_description" "$repo_branch" "$repo_slug"
+	done
+fi
+
+# External allowlist discovery is separate from the official org API path.
+external_plugin_allowlist=(
+	"https://github.com/diegopetrucci/stavrobot-apple-reminders-plugin"
+)
+
+for allowlisted_repo_url in "${external_plugin_allowlist[@]}"; do
+	repo_path="${allowlisted_repo_url#https://github.com/}"
+	repo_path="${repo_path%/}"
+	repo_path="${repo_path%.git}"
+	repo_owner="${repo_path%%/*}"
+	repo_name="${repo_path#*/}"
+
+	external_repo_json="$(curl -sf "${gh_auth[@]}" "https://api.github.com/repos/${repo_owner}/${repo_name}")" || true
+	[ -n "$external_repo_json" ] || continue
+
+	repo_owner="$(python3 -c 'import sys,json; print(json.load(sys.stdin)["owner"]["login"])' <<<"$external_repo_json")"
+	repo_name="$(python3 -c 'import sys,json; print(json.load(sys.stdin)["name"])' <<<"$external_repo_json")"
+	repo_description="$(python3 -c 'import sys,json; print(json.load(sys.stdin).get("description") or "")' <<<"$external_repo_json")"
+	repo_url="$(python3 -c 'import sys,json; print(json.load(sys.stdin)["html_url"])' <<<"$external_repo_json")"
+	repo_branch="$(python3 -c 'import sys,json; print(json.load(sys.stdin).get("default_branch") or "HEAD")' <<<"$external_repo_json")"
+	repo_slug="$(derive_plugin_slug "$repo_name")"
+
+	append_discovered_repo "$repo_owner" "$repo_name" "$repo_url" "$repo_description" "$repo_branch" "$repo_slug"
+done
+
+# Generate Zola content files for the plugins section.
+# Remove first to prevent ghost pages from deleted or renamed plugins.
+rm -rf "$REPO_ROOT/content/plugins"
+mkdir -p "$REPO_ROOT/content/plugins"
+
+cat >"$REPO_ROOT/content/plugins/_index.md" <<'ZOLA_EOF'
++++
+title = "Plugins"
+sort_by = "title"
+template = "plugins/list.html"
++++
+ZOLA_EOF
+
+# Use one shared details-reading path for all discovered repos.
+for i in "${!discovered_repo_names[@]}"; do
+	manifest_json="$(curl -sf "https://raw.githubusercontent.com/${discovered_repo_owners[$i]}/${discovered_repo_names[$i]}/${discovered_repo_branches[$i]}/manifest.json")" || true
+	[ -n "$manifest_json" ] || continue
+
+	readme="$(curl -sf "https://raw.githubusercontent.com/${discovered_repo_owners[$i]}/${discovered_repo_names[$i]}/${discovered_repo_branches[$i]}/README.md")" || true
+	plugin_name="$(python3 -c 'import sys,json; print(json.load(sys.stdin)["name"])' <<<"$manifest_json")"
+
+	plugin_names+=("$plugin_name")
+	plugin_descriptions+=("${discovered_repo_descriptions[$i]}")
+	plugin_urls+=("${discovered_repo_urls[$i]}")
+	plugin_slugs+=("${discovered_repo_slugs[$i]}")
+	plugin_readmes+=("$readme")
+done
+
+sorted_plugins=()
+if [ "${#plugin_names[@]}" -gt 0 ]; then
+	mapfile -t sorted_plugins < <(
+		for i in "${!plugin_names[@]}"; do
+			printf '%s\t%s\t%s\t%s\t%s\n' \
+				"${plugin_names[$i]}" \
+				"${plugin_descriptions[$i]}" \
+				"${plugin_urls[$i]}" \
+				"${plugin_slugs[$i]}" \
+				"$i"
+		done | LC_ALL=C sort -f
+	)
+fi
 
 {
 	echo "# Plugins"
@@ -96,97 +246,37 @@ mkdir -p "$REPO_ROOT/static/plugins"
 	echo ""
 	echo "| Name | Description | URL |"
 	echo "|------|-------------|-----|"
+
+	for plugin_line in "${sorted_plugins[@]}"; do
+		plugin_name="$(cut -f1 <<<"$plugin_line")"
+		plugin_description="$(cut -f2 <<<"$plugin_line")"
+		plugin_url="$(cut -f3 <<<"$plugin_line")"
+		echo "| ${plugin_name} | ${plugin_description} | ${plugin_url} |"
+	done
 } >"$REPO_ROOT/static/plugins/index.md"
 
-# Use a GitHub token if available to avoid API rate limits on shared CI IPs.
-gh_auth=()
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-	gh_auth=(-H "Authorization: token $GITHUB_TOKEN")
-fi
-
-repos_json="$(curl -sf "${gh_auth[@]}" "https://api.github.com/orgs/stavrobot/repos?per_page=100")" || true
-
-# Declared unconditionally so the Zola content loop below is safe under set -u
-# even when the API call fails and the if block is never entered.
-plugin_names=()
-plugin_descriptions=()
-plugin_urls=()
-plugin_slugs=()
-plugin_repo_names=()
-plugin_branches=()
-
-if [ -n "$repos_json" ]; then
-	# Extract names, descriptions, html_urls, and default_branches for plugin-* repos.
-	# Output one line per repo: name\tdescription\thtml_url\tdefault_branch
-	mapfile -t plugin_repos < <(
-		python3 -c '
-import sys, json
-repos = json.load(sys.stdin)
-for repo in repos:
-    if repo["name"].startswith("plugin-"):
-        name = repo["name"]
-        description = repo.get("description") or ""
-        html_url = repo["html_url"]
-        default_branch = repo.get("default_branch") or "HEAD"
-        print(f"{name}\t{description}\t{html_url}\t{default_branch}")
-' <<<"$repos_json" | sort
-	)
-
-	for repo_line in "${plugin_repos[@]}"; do
-		repo_name="$(cut -f1 <<<"$repo_line")"
-		repo_description="$(cut -f2 <<<"$repo_line")"
-		repo_url="$(cut -f3 <<<"$repo_line")"
-		repo_branch="$(cut -f4 <<<"$repo_line")"
-
-		manifest_json="$(curl -sf "https://raw.githubusercontent.com/stavrobot/${repo_name}/${repo_branch}/manifest.json")" || true
-		[ -n "$manifest_json" ] || continue
-
-		plugin_name="$(python3 -c 'import sys,json; print(json.load(sys.stdin)["name"])' <<<"$manifest_json")"
-		plugin_slug="${repo_name#plugin-}"
-
-		plugin_names+=("$plugin_name")
-		plugin_descriptions+=("$repo_description")
-		plugin_urls+=("$repo_url")
-		plugin_slugs+=("$plugin_slug")
-		plugin_repo_names+=("$repo_name")
-		plugin_branches+=("$repo_branch")
-	done
-
-	for i in "${!plugin_names[@]}"; do
-		echo "| ${plugin_names[$i]} | ${plugin_descriptions[$i]} | ${plugin_urls[$i]} |" >>"$REPO_ROOT/static/plugins/index.md"
-	done
-fi
-
-# Generate Zola content files for the plugins section.
-# Remove first to prevent ghost pages from deleted or renamed plugins.
-rm -rf "$REPO_ROOT/content/plugins"
-mkdir -p "$REPO_ROOT/content/plugins"
-
-cat >"$REPO_ROOT/content/plugins/_index.md" <<'ZOLA_EOF'
-+++
-title = "Plugins"
-sort_by = "title"
-template = "plugins/list.html"
-+++
-ZOLA_EOF
-
-for i in "${!plugin_names[@]}"; do
-	readme="$(curl -sf "https://raw.githubusercontent.com/stavrobot/${plugin_repo_names[$i]}/${plugin_branches[$i]}/README.md")" || true
+for plugin_line in "${sorted_plugins[@]}"; do
+	plugin_name="$(cut -f1 <<<"$plugin_line")"
+	plugin_description="$(cut -f2 <<<"$plugin_line")"
+	plugin_url="$(cut -f3 <<<"$plugin_line")"
+	plugin_slug="$(cut -f4 <<<"$plugin_line")"
+	plugin_index="$(cut -f5 <<<"$plugin_line")"
+	readme="${plugin_readmes[$plugin_index]}"
 
 	{
 		echo '+++'
-		echo "title = $(printf '%s' "${plugin_names[$i]}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')"
-		echo "description = $(printf '%s' "${plugin_descriptions[$i]}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')"
+		echo "title = $(printf '%s' "$plugin_name" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')"
+		echo "description = $(printf '%s' "$plugin_description" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')"
 		echo "template = \"plugins/page.html\""
 		echo ""
 		echo "[extra]"
-		echo "repo_url = $(printf '%s' "${plugin_urls[$i]}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')"
+		echo "repo_url = $(printf '%s' "$plugin_url" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')"
 		echo '+++'
 		if [ -n "$readme" ]; then
 			echo ""
 			printf '%s\n' "$readme"
 		fi
-	} >"$REPO_ROOT/content/plugins/${plugin_slugs[$i]}.md"
+	} >"$REPO_ROOT/content/plugins/${plugin_slug}.md"
 done
 
 if [ "$content_only" = false ]; then
